@@ -387,6 +387,83 @@ export function getNearbyBlockTypes(bot, distance=16) {
     return found;
 }
 
+const AIR_BLOCKS = ['air', 'cave_air', 'void_air'];
+
+function isSeeThrough(block) {
+    // a neighbor that does not fully cover the face of a block (air, liquids, glass, leaves, torches, slabs...)
+    return !block || AIR_BLOCKS.includes(block.name) || block.transparent || block.boundingBox !== 'block';
+}
+
+export function getBlocksInRadius(bot, radius=6, exposedOnly=true) {
+    /**
+     * Get every non-air block in a cube around the bot, with absolute integer positions, sorted by distance.
+     * @param {Bot} bot - The bot to scan around.
+     * @param {number} radius - Half the side of the scanned cube, default 6 (scans a 13x13x13 cube).
+     * @param {boolean} exposedOnly - If true, skip blocks fully enclosed by solid blocks on all 6 sides, default true.
+     * @returns {{name: string, x: number, y: number, z: number, distance: number}[]} - The blocks found.
+     * @example
+     * let blocks = world.getBlocksInRadius(bot, 6);
+     * let logs = blocks.filter(b => b.name === 'oak_log');
+     **/
+    const center = bot.entity.position.floored();
+    const neighbors = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];
+    let res = [];
+    for (let dx = -radius; dx <= radius; dx++) {
+        for (let dy = -radius; dy <= radius; dy++) {
+            for (let dz = -radius; dz <= radius; dz++) {
+                const pos = center.offset(dx, dy, dz);
+                const block = bot.blockAt(pos);
+                if (!block || AIR_BLOCKS.includes(block.name)) continue;
+                if (exposedOnly && !neighbors.some(([nx, ny, nz]) => isSeeThrough(bot.blockAt(pos.offset(nx, ny, nz)))))
+                    continue;
+                let name = block.name;
+                if (name === 'water' || name === 'lava')
+                    name += block.metadata === 0 ? ' (source)' : ' (flowing)';
+                res.push({ name, x: pos.x, y: pos.y, z: pos.z, distance: Math.sqrt(dx*dx + dy*dy + dz*dz) });
+            }
+        }
+    }
+    res.sort((a, b) => a.distance - b.distance);
+    return res;
+}
+
+const MAX_SCANNED_BLOCKS = 600; // keeps one scan under ~6k tokens
+
+export function describeBlocksInRadius(bot, radius=6, exposedOnly=true) {
+    /**
+     * Text report of getBlocksInRadius grouped by block type, for the language model.
+     * Also records the scanned area in bot.last_block_scan.
+     * @param {Bot} bot - The bot to scan around.
+     * @param {number} radius - Scan radius, default 6.
+     * @param {boolean} exposedOnly - Skip fully buried blocks, default true.
+     * @returns {string} - The report.
+     **/
+    const center = bot.entity.position.floored();
+    let blocks = getBlocksInRadius(bot, radius, exposedOnly);
+    bot.last_block_scan = { x: center.x, y: center.y, z: center.z, radius, time: Date.now() };
+    const total = blocks.length;
+    if (total > MAX_SCANNED_BLOCKS)
+        blocks = blocks.slice(0, MAX_SCANNED_BLOCKS);
+
+    // types ordered by their nearest block, positions within a type ordered by distance
+    let groups = new Map();
+    for (const b of blocks) {
+        if (!groups.has(b.name)) groups.set(b.name, []);
+        groups.get(b.name).push(`(${b.x},${b.y},${b.z})`);
+    }
+
+    let res = `SCANNED_BLOCKS (radius ${radius}, center ${center.x},${center.y},${center.z}` +
+        `${exposedOnly ? ', exposed blocks only' : ''}, format x,y,z)`;
+    for (const [name, positions] of groups) {
+        res += `\n- ${name} [${positions.length}]: ${positions.join(' ')}`;
+    }
+    if (total === 0)
+        res += ': none (only air)';
+    else if (total > blocks.length)
+        res += `\n(${total - blocks.length} farther blocks omitted, use a smaller radius or exposed_only=true)`;
+    return res;
+}
+
 export async function isClearPath(bot, target) {
     /**
      * Check if there is a path to the target that requires no digging or placing blocks.

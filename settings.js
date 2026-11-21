@@ -30,7 +30,7 @@ const settings = {
     "init_message": "Respond with hello world and your name", // sends to all on spawn
     "only_chat_with": [], // users that the bots listen to and send general messages to. if empty it will chat publicly
 
-    "speak": false,
+    "speak": true,
     // allows all bots to speak through text-to-speech. 
     // specify speech model inside each profile with format: {provider}/{model}/{voice}.
     // if set to "system" it will use basic system text-to-speech. 

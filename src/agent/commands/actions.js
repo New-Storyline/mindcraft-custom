@@ -1,12 +1,80 @@
 import * as skills from '../library/skills.js';
 import settings from '../settings.js';
 import convoManager from '../conversation.js';
+import Vec3 from 'vec3';
+import * as world from '../library/world.js';
+import * as batch from './block_batch.js';
+
+const MAX_BUILD_DISTANCE = 32;
+// same list skills.placeBlock treats as empty space
+const REPLACEABLE_BLOCKS = ['air', 'cave_air', 'void_air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
+
+const SCAN_MAX_AGE_MS = 5 * 60 * 1000;
+const AUTO_SCAN_RADIUS = 6;
+
+// Models tend to guess coordinates from their own position instead of scanning.
+// Refuse coordinate actions unless a recent !scanBlocks covers the targets; if there is none, scan now
+// and hand the result back so the model can correct its coordinates on the next call.
+// Single-block actions need the target inside the scan; batch actions (which may be bigger than the
+// scanned cube) need at least one target inside it, so the structure is anchored to what the model saw.
+function requireRecentScan(agent, positions, requireAll = true) {
+    const bot = agent.bot;
+    const scan = bot.last_block_scan;
+    const first = positions[0].join(', ');
+    if (!scan || Date.now() - scan.time > SCAN_MAX_AGE_MS) {
+        const report = world.describeBlocksInRadius(bot, AUTO_SCAN_RADIUS, true);
+        return `Not done: you have not scanned the area recently, so ${first} may be a guess. ` +
+            `Here is a fresh scan. Find the target in it, then call the command again with the correct coordinates.\n${report}`;
+    }
+    const inside = ([x, y, z]) => Math.abs(x - scan.x) <= scan.radius && Math.abs(y - scan.y) <= scan.radius && Math.abs(z - scan.z) <= scan.radius;
+    const scanDesc = `your last scan (center ${scan.x},${scan.y},${scan.z}, radius ${scan.radius})`;
+    if (requireAll && !positions.every(inside)) {
+        const outside = positions.find(p => !inside(p)).join(', ');
+        return `Not done: ${outside} is outside ${scanDesc}. Move closer to the target and use !scanBlocks first.`;
+    }
+    if (!requireAll && !positions.some(inside)) {
+        return `Not done: none of the target positions are inside ${scanDesc}. Move closer to the target and use !scanBlocks first.`;
+    }
+    const pos = bot.entity.position;
+    const far = positions.find(([x, y, z]) => pos.distanceTo(new Vec3(x + 0.5, y + 0.5, z + 0.5)) > MAX_BUILD_DISTANCE);
+    if (far) {
+        return `Not done: ${far.join(', ')} is more than ${MAX_BUILD_DISTANCE} blocks away from you. Move closer first.`;
+    }
+    return null;
+}
+
+// precheck for batch commands: validates the parsed positions, then the scan
+function batchPrecheck(agent, positions) {
+    if (typeof positions === 'string') return positions; // parse error message
+    return requireRecentScan(agent, positions, false);
+}
+
+// returns the block at x,y,z, or logs why it can't be targeted and returns null
+function checkTargetBlock(bot, x, y, z) {
+    const target_pos = new Vec3(x, y, z);
+    const dist = bot.entity.position.distanceTo(target_pos.offset(0.5, 0.5, 0.5));
+    if (dist > MAX_BUILD_DISTANCE) {
+        skills.log(bot, `${x}, ${y}, ${z} is ${Math.round(dist)} blocks away, max is ${MAX_BUILD_DISTANCE}. Move closer first.`);
+        return null;
+    }
+    const block = bot.blockAt(target_pos);
+    if (!block) {
+        skills.log(bot, `Position ${x}, ${y}, ${z} is not loaded.`);
+        return null;
+    }
+    return block;
+}
 
 
-function runAsAction (actionFn, resume = false, timeout = -1) {
+// precheck(agent, ...args) may return a string to answer the model directly without running the action
+function runAsAction (actionFn, resume = false, timeout = -1, precheck = null) {
     let actionLabel = null;  // Will be set on first use
-    
+
     const wrappedAction = async function (agent, ...args) {
+        if (precheck) {
+            const refusal = precheck(agent, ...args);
+            if (refusal) return refusal;
+        }
         // Set actionLabel only once, when the action is first created
         if (!actionLabel) {
             const actionObj = actionsList.find(a => a.perform === wrappedAction);
@@ -300,12 +368,105 @@ export const actionsList = [
     },
         {
         name: '!placeHere',
-        description: 'Place a given block in the current location. Do NOT use to build structures, only use for single blocks/torches.',
+        description: 'Place a given block in the current location. Do NOT use to build structures, only use for single blocks/torches. To place at exact coordinates use !placeBlockAt.',
         params: {'type': { type: 'BlockOrItemName', description: 'The block type to place.' }},
         perform: runAsAction(async (agent, type) => {
             let pos = agent.bot.entity.position;
             await skills.placeBlock(agent.bot, type, pos.x, pos.y, pos.z);
         })
+    },
+    {
+        name: '!placeBlockAt',
+        description: `Place a block at exact world coordinates. Requires a !scanBlocks from the last 5 minutes that covers the target; take coordinates from its output, never guess them. The target must be empty (air, water, grass...) and must touch an existing block to build off. Walks there if needed, max ${MAX_BUILD_DISTANCE} blocks away.`,
+        params: {
+            'type': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x': { type: 'int', description: 'The x coordinate.', domain: [-30000000, 30000000] },
+            'y': { type: 'int', description: 'The y coordinate.', domain: [-64, 320] },
+            'z': { type: 'int', description: 'The z coordinate.', domain: [-30000000, 30000000] }
+        },
+        perform: runAsAction(async (agent, type, x, y, z) => {
+            const bot = agent.bot;
+            if (type === 'air') {
+                skills.log(bot, 'To remove a block use !breakBlockAt.');
+                return;
+            }
+            const target = checkTargetBlock(bot, x, y, z);
+            if (!target) return;
+            if (target.name === type) {
+                skills.log(bot, `${type} is already at ${x}, ${y}, ${z}.`);
+                return;
+            }
+            if (!REPLACEABLE_BLOCKS.includes(target.name)) {
+                skills.log(bot, `Cannot place ${type} at ${x}, ${y}, ${z}: ${target.name} is in the way. Use !breakBlockAt first if you want to replace it.`);
+                return;
+            }
+            await skills.placeBlock(bot, type, x, y, z);
+        }, false, -1, (agent, type, x, y, z) => requireRecentScan(agent, [[x, y, z]]))
+    },
+    {
+        name: '!breakBlockAt',
+        description: `Break the block at exact world coordinates. Requires a !scanBlocks from the last 5 minutes that covers the target. Walks there if needed, max ${MAX_BUILD_DISTANCE} blocks away.`,
+        params: {
+            'x': { type: 'int', description: 'The x coordinate.', domain: [-30000000, 30000000] },
+            'y': { type: 'int', description: 'The y coordinate.', domain: [-64, 320] },
+            'z': { type: 'int', description: 'The z coordinate.', domain: [-30000000, 30000000] }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            if (!checkTargetBlock(agent.bot, x, y, z)) return;
+            await skills.breakBlockAt(agent.bot, x, y, z);
+        }, false, -1, (agent, x, y, z) => requireRecentScan(agent, [[x, y, z]]))
+    },
+    {
+        name: '!placeBlocks',
+        description: `Place many blocks of one type at a list of exact coordinates, for building walls, floors, pillars or any shape. Requires a recent !scanBlocks near the build. Builds bottom-up and retries blocks that had nothing to build off. Max ${batch.MAX_BATCH_BLOCKS} blocks per call.`,
+        params: {
+            'type': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'positions': { type: 'string', description: 'Coordinates as "x,y,z;x,y,z;...", e.g. "10,64,-3;11,64,-3;12,64,-3".' }
+        },
+        perform: runAsAction(async (agent, type, positions) => {
+            await batch.placeBatch(agent.bot, type, batch.parsePositions(positions), REPLACEABLE_BLOCKS);
+        }, false, -1, (agent, type, positions) => batchPrecheck(agent, batch.parsePositions(positions)))
+    },
+    {
+        name: '!fillBlocks',
+        description: `Fill the whole box between two corner blocks (inclusive) with one block type, like /fill. A 1-thick box makes a wall or floor. Requires a recent !scanBlocks near the build. Blocks already occupied by something else are skipped, not replaced. Max ${batch.MAX_BATCH_BLOCKS} blocks per call.`,
+        params: {
+            'type': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x1': { type: 'int', description: 'First corner x.', domain: [-30000000, 30000000] },
+            'y1': { type: 'int', description: 'First corner y.', domain: [-64, 320] },
+            'z1': { type: 'int', description: 'First corner z.', domain: [-30000000, 30000000] },
+            'x2': { type: 'int', description: 'Opposite corner x.', domain: [-30000000, 30000000] },
+            'y2': { type: 'int', description: 'Opposite corner y.', domain: [-64, 320] },
+            'z2': { type: 'int', description: 'Opposite corner z.', domain: [-30000000, 30000000] }
+        },
+        perform: runAsAction(async (agent, type, ...corners) => {
+            await batch.placeBatch(agent.bot, type, batch.boxPositions(...corners), REPLACEABLE_BLOCKS);
+        }, false, -1, (agent, type, ...corners) => batchPrecheck(agent, batch.boxPositions(...corners)))
+    },
+    {
+        name: '!breakBlocks',
+        description: `Break many blocks at a list of exact coordinates. Requires a recent !scanBlocks near the targets. Breaks top-down. Max ${batch.MAX_BATCH_BLOCKS} blocks per call.`,
+        params: {
+            'positions': { type: 'string', description: 'Coordinates as "x,y,z;x,y,z;...", e.g. "10,64,-3;10,65,-3".' }
+        },
+        perform: runAsAction(async (agent, positions) => {
+            await batch.breakBatch(agent.bot, batch.parsePositions(positions));
+        }, false, -1, (agent, positions) => batchPrecheck(agent, batch.parsePositions(positions)))
+    },
+    {
+        name: '!clearArea',
+        description: `Break every block in the box between two corner blocks (inclusive), leaving air. Requires a recent !scanBlocks near the area. Breaks top-down. Max ${batch.MAX_BATCH_BLOCKS} positions per call.`,
+        params: {
+            'x1': { type: 'int', description: 'First corner x.', domain: [-30000000, 30000000] },
+            'y1': { type: 'int', description: 'First corner y.', domain: [-64, 320] },
+            'z1': { type: 'int', description: 'First corner z.', domain: [-30000000, 30000000] },
+            'x2': { type: 'int', description: 'Opposite corner x.', domain: [-30000000, 30000000] },
+            'y2': { type: 'int', description: 'Opposite corner y.', domain: [-64, 320] },
+            'z2': { type: 'int', description: 'Opposite corner z.', domain: [-30000000, 30000000] }
+        },
+        perform: runAsAction(async (agent, ...corners) => {
+            await batch.breakBatch(agent.bot, batch.boxPositions(...corners));
+        }, false, -1, (agent, ...corners) => batchPrecheck(agent, batch.boxPositions(...corners)))
     },
     {
         name: '!attack',

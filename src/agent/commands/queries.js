@@ -5,6 +5,8 @@ import convoManager from '../conversation.js';
 import { checkLevelBlueprint, checkBlueprint } from '../tasks/construction_tasks.js';
 import { load } from 'cheerio';
 
+const MAX_SCAN_RADIUS = 10;
+
 const pad = (str) => {
     return '\n' + str + '\n';
 }
@@ -20,6 +22,8 @@ export const queryList = [
             let pos = bot.entity.position;
             // display position to 2 decimal places
             res += `\n- Position: x: ${pos.x.toFixed(2)}, y: ${pos.y.toFixed(2)}, z: ${pos.z.toFixed(2)}`;
+            const block_pos = pos.floored();
+            res += `\n- Block position (feet): ${block_pos.x}, ${block_pos.y}, ${block_pos.z}`;
             // Gameplay
             res += `\n- Gamemode: ${bot.game.gameMode}`;
             res += `\n- Health: ${Math.round(bot.health)} / 20`;
@@ -127,6 +131,17 @@ export const queryList = [
                 res += `\n- First Solid Block Above Head: ${world.getFirstBlockAboveHead(bot, null, 32)}`;
             }
             return pad(res);
+        }
+    },
+    {
+        name: "!scanBlocks",
+        description: "Get the exact positions of all non-air blocks around you, grouped by block type. Use this before building or placing blocks at specific coordinates.",
+        params: {
+            'radius': { type: 'int', description: 'Scan radius around you. 6 is recommended.', domain: [1, MAX_SCAN_RADIUS, '[]'] },
+            'exposed_only': { type: 'boolean', description: 'If true, skip blocks completely buried by other blocks (recommended, much shorter output).' }
+        },
+        perform: function (agent, radius, exposed_only) {
+            return pad(world.describeBlocksInRadius(agent.bot, radius, exposed_only));
         }
     },
     {
