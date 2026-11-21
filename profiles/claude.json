@@ -1,7 +1,11 @@
 {
     "name": "claude",
 
-    "model": "claude-sonnet-4-6",
-    
-    "embedding": "openai"
+    "model": {
+        "api": "anthropic",
+        "model": "claude-haiku-5-5",
+        "params": {
+            "output_config": { "effort": "low" }
+        }
+    }
 }
